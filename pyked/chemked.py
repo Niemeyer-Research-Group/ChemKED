@@ -2,6 +2,7 @@
 Main ChemKED module
 """
 # Standard libraries
+import os
 from os.path import exists
 from collections import namedtuple
 from warnings import warn
@@ -11,6 +12,7 @@ import xml.dom.minidom as minidom
 from itertools import chain
 
 import numpy as np
+import pandas as pd
 
 # Local imports
 from .validation import schema, OurValidator, yaml, Q_
@@ -77,6 +79,11 @@ Composition.SMILES.__doc__ = '(`str`) The SMILES identifier for the species'
 Composition.atomic_composition.__doc__ = '(`dict`) The atomic composition of the species'
 Composition.amount.__doc__ = '(`~pint.Quantity`) The amount of this species'
 
+JSR_Outlet_Composition = namedtuple('Composition', 'species_name InChI  amount')
+JSR_Outlet_Composition.__doc__ = 'Detail of the outlet composition of the mixture for the JSR experiment'
+JSR_Outlet_Composition.species_name.__doc__ = '(`str`) The name of the species'
+JSR_Outlet_Composition.InChI.__doc__ = '(`str`) The InChI identifier for the species'
+JSR_Outlet_Composition.amount.__doc__ = '(`list(~pint.Quantity)`) The amount of this species'
 
 class ChemKED(object):
     """Main ChemKED class.
@@ -120,8 +127,16 @@ class ChemKED(object):
             self.validate_yaml(self._properties)
 
         self.datapoints = []
-        for point in self._properties['datapoints']:
-            self.datapoints.append(DataPoint(point))
+        if self._properties['experiment-type'] == 'ignition delay':
+            for point in self._properties['datapoints']:
+                self.datapoints.append(IgnitionDataPoint(point))
+        elif self._properties['experiment-type'] == 'species profile':
+            assert len(self._properties['datapoints']) == 1, "Only one CSV file per YAML file please"
+            for point in self._properties['datapoints']:
+                csv_file = os.path.join(os.path.split(yaml_file)[0], point['csvfile'])
+                csv_df= pd.read_csv(csv_file)
+                self.datapoints.append(SpeciesProfileDataPoint(point, csv_df))
+
 
         self.reference = Reference(
             volume=self._properties['reference'].get('volume'),
@@ -584,12 +599,144 @@ class ChemKED(object):
 
         print('Converted to ' + filename)
 
-
 class DataPoint(object):
-    """Class for a single datapoint.
+    """
+    A base class for a single datapoint.
 
-    The `DataPoint` class stores the information associated with a single data point in the dataset
-    parsed from the `ChemKED` YAML input.
+    Specific types of data point should inherit from this.
+    """
+    def process_column(self, csv_df,properties=None,outlet_comp=False,species_name=None):
+        """
+        Process a column data and return as a list of units.Quantity objects
+        csv_df is a Pandas DataFrame.
+        """
+        if not outlet_comp:
+            column_name = properties[0]['column-name']
+            data_list = []
+            for value in csv_df[column_name]:
+                for p in properties:
+                    units = p.get('units', '')
+                    if units: break
+                    #todo: schema should enforce at most 1 units entry
+                
+                value_properties = [ f'{value} {units}' ]
+
+                for p in properties:
+                    if p.get('uncertainty-type', False):
+                        # this is the uncertainty data
+                        value_properties.append(p)
+
+                quant = self.process_quantity(value_properties)
+                data_list.append(quant)
+        elif outlet_comp and species_name:
+            species_amounts = csv_df[species_name]
+            data_list = []
+            for species_amount in species_amounts:
+                column_property = [f'{species_amount}']
+                data_list.append(self.process_quantity(column_property))
+        return data_list
+
+
+    def process_quantity(self, properties):
+        """
+        Process the units and uncertainty information from a given quantity 
+        and return it as a units.Quantity object.
+        """
+        quant = Q_(properties[0])
+        if len(properties) > 1:
+            unc = properties[1]
+            uncertainty = unc.get('uncertainty', False)
+            upper_uncertainty = unc.get('upper-uncertainty', False)
+            lower_uncertainty = unc.get('lower-uncertainty', False)
+            uncertainty_type = unc.get('uncertainty-type')
+            if uncertainty_type == 'relative':
+                if uncertainty:
+                    quant = quant.plus_minus(float(uncertainty), relative=True)
+                elif upper_uncertainty and lower_uncertainty:
+                    warn('Asymmetric uncertainties are not supported. The '
+                         'maximum of lower-uncertainty and upper-uncertainty '
+                         'has been used as the symmetric uncertainty.')
+                    uncertainty = max(float(upper_uncertainty), float(lower_uncertainty))
+                    quant = quant.plus_minus(uncertainty, relative=True)
+                else:
+                    raise ValueError('Either "uncertainty" or "upper-uncertainty" and '
+                                     '"lower-uncertainty" need to be specified.')
+            elif uncertainty_type == 'absolute':
+                if uncertainty:
+                    uncertainty = Q_(uncertainty)
+                    quant = quant.plus_minus(uncertainty.to(quant.units).magnitude)
+                elif upper_uncertainty and lower_uncertainty:
+                    warn('Asymmetric uncertainties are not supported. The '
+                         'maximum of lower-uncertainty and upper-uncertainty '
+                         'has been used as the symmetric uncertainty.')
+                    uncertainty = max(Q_(upper_uncertainty), Q_(lower_uncertainty))
+                    quant = quant.plus_minus(uncertainty.to(quant.units).magnitude)
+                else:
+                    raise ValueError('Either "uncertainty" or "upper-uncertainty" and '
+                                     '"lower-uncertainty" need to be specified.')
+            else:
+                raise ValueError('uncertainty-type must be one of "absolute" or "relative"')
+        return quant
+
+
+class SpeciesProfileDataPoint(DataPoint):
+    """
+    Class for a single JSR experiment data point.
+
+    """
+    value_unit_props = [
+        'pressure', 'reactor-volume', 'residence-time'
+    ]
+
+    column_unit_props = [
+        'temperature',
+    ]
+
+    def __init__(self, properties, csv_df):
+        for prop in self.value_unit_props:
+            if prop in properties:
+                quant = self.process_quantity(properties[prop])
+                setattr(self, prop.replace('-', '_'), quant)
+            else:
+                setattr(self, prop.replace('-', '_'), None)
+
+        for prop in self.column_unit_props:
+            if prop in properties:
+                data_list = self.process_column(properties = properties[prop], csv_df = csv_df)
+                setattr(self, prop.replace('-', '_'), data_list)
+            else:
+                setattr(self, prop.replace('-', '_'), None)
+
+        self.inlet_composition_type = properties['inlet-composition']['kind']
+        inlet_composition = {}
+        for species in properties['inlet-composition']['species']:
+            species_name = species['species-name']
+            amount = self.process_quantity(species['amount'])
+            InChI = species.get('InChI')
+            SMILES = species.get('SMILES')
+            atomic_composition = species.get('atomic-composition')
+            inlet_composition[species_name] = Composition(
+                species_name=species_name, InChI=InChI, SMILES=SMILES,
+                atomic_composition=atomic_composition, amount=amount)
+
+        setattr(self, 'inlet_composition', inlet_composition)
+
+
+        self.outlet_composition_type = properties['outlet-composition']['kind']
+        outlet_composition = {}
+        for species in properties['outlet-composition']['species']:
+            species_name = species['species-name']
+            list_of_pint_quantitites = self.process_column(csv_df = csv_df,species_name=species_name,outlet_comp=True)
+            InChI = species.get('InChI')
+            outlet_composition[species_name] = JSR_Outlet_Composition(
+                species_name=species_name, InChI=InChI, amount=list_of_pint_quantitites)
+
+        setattr(self, 'outlet_composition', outlet_composition)
+class IgnitionDataPoint(DataPoint):
+    """Class for a single ignition delay datapoint.
+
+    The `IgnitionDataPoint` class stores the information associated with a single ignition data point 
+    in the dataset parsed from the `ChemKED` YAML input.
 
     Arguments:
         properties (`dict`): Dictionary adhering to the ChemKED format for ``datapoints``
@@ -719,45 +866,7 @@ class DataPoint(object):
             if not hasattr(self, '{}_history'.format(h)):
                 setattr(self, '{}_history'.format(h), None)
 
-    def process_quantity(self, properties):
-        """Process the uncertainty information from a given quantity and return it
-        """
-        quant = Q_(properties[0])
-        if len(properties) > 1:
-            unc = properties[1]
-            uncertainty = unc.get('uncertainty', False)
-            upper_uncertainty = unc.get('upper-uncertainty', False)
-            lower_uncertainty = unc.get('lower-uncertainty', False)
-            uncertainty_type = unc.get('uncertainty-type')
-            if uncertainty_type == 'relative':
-                if uncertainty:
-                    quant = quant.plus_minus(float(uncertainty), relative=True)
-                elif upper_uncertainty and lower_uncertainty:
-                    warn('Asymmetric uncertainties are not supported. The '
-                         'maximum of lower-uncertainty and upper-uncertainty '
-                         'has been used as the symmetric uncertainty.')
-                    uncertainty = max(float(upper_uncertainty), float(lower_uncertainty))
-                    quant = quant.plus_minus(uncertainty, relative=True)
-                else:
-                    raise ValueError('Either "uncertainty" or "upper-uncertainty" and '
-                                     '"lower-uncertainty" need to be specified.')
-            elif uncertainty_type == 'absolute':
-                if uncertainty:
-                    uncertainty = Q_(uncertainty)
-                    quant = quant.plus_minus(uncertainty.to(quant.units).magnitude)
-                elif upper_uncertainty and lower_uncertainty:
-                    warn('Asymmetric uncertainties are not supported. The '
-                         'maximum of lower-uncertainty and upper-uncertainty '
-                         'has been used as the symmetric uncertainty.')
-                    uncertainty = max(Q_(upper_uncertainty), Q_(lower_uncertainty))
-                    quant = quant.plus_minus(uncertainty.to(quant.units).magnitude)
-                else:
-                    raise ValueError('Either "uncertainty" or "upper-uncertainty" and '
-                                     '"lower-uncertainty" need to be specified.')
-            else:
-                raise ValueError('uncertainty-type must be one of "absolute" or "relative"')
 
-        return quant
 
     def get_cantera_composition_string(self, species_conversion=None):
         """Get the composition in a string format suitable for input to Cantera.
